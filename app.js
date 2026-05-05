@@ -86,8 +86,10 @@ async function insertAttendance(type) {
         date,
         time_ist: datetimeIST,
         time_utc: datetimeUTC,
-        day_counter: `${dayCounter + 1}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`
-      };
+        day_counter: `${dayCounter + 1}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`,
+        sign_in_location: "F/N Ward, Maharashtra",
+        sign_out_location: "F/N Ward, Maharashtra",
+      };    
 
       console.log(`✅ CHECKIN recorded for ${EMPLOYEE_NAME} (${EMPLOYEE_ID})`);
       console.log(`📅 Date: ${date} | ⏰ IST: ${datetimeIST} | UTC: ${datetimeUTC}`);
@@ -134,7 +136,9 @@ async function insertAttendance(type) {
         work_hours: parseFloat(result.rows[0].work_hours).toFixed(2),
         time_ist: datetimeIST,
         time_utc: datetimeUTC,
-        day_counter: `${dayCounter}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`
+        day_counter: `${dayCounter}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`,
+        sign_in_location: "F/N Ward, Maharashtra",
+        sign_out_location: "F/N Ward, Maharashtra",
       };
 
       console.log(`✅ CHECKOUT recorded for ${EMPLOYEE_NAME} (${EMPLOYEE_ID})`);
