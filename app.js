@@ -9,21 +9,25 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Configuration ──────────────────────────────────────────────
-const EMPLOYEE_ID = process.env.ATTENDANCE_EMPLOYEE_ID || 'EL-0026';
+const EMPLOYEE_ID   = process.env.ATTENDANCE_EMPLOYEE_ID   || 'EL-0026';
 const EMPLOYEE_NAME = process.env.ATTENDANCE_EMPLOYEE_NAME || 'Pawan Prasad';
-const MAX_DAYS = parseInt(process.env.ATTENDANCE_MAX_DAYS) || 7;
-const TIMEZONE = 'Asia/Kolkata';
-const PORT = process.env.PORT || 4000;
+const MAX_DAYS      = parseInt(process.env.ATTENDANCE_MAX_DAYS) || 7;
+const TIMEZONE      = 'Asia/Kolkata';
+const PORT          = process.env.PORT || 4000;
+
+// Default locations (override per-request via body, or set in .env)
+const DEFAULT_SIGNIN_LOCATION  = process.env.SIGNIN_LOCATION  || 'Mumbai, Maharashtra, India';
+const DEFAULT_SIGNOUT_LOCATION = process.env.SIGNOUT_LOCATION || 'P/S Mumbai, Maharashtra, India';
 
 // ─── Day counter (resets at midnight IST automatically) ─────────
-let dayCounter = 0;
+let dayCounter    = 0;
 let lastResetDate = moment().tz(TIMEZONE).format('YYYY-MM-DD');
 
 function checkAndResetCounter() {
   const today = moment().tz(TIMEZONE).format('YYYY-MM-DD');
   if (today !== lastResetDate) {
     console.log('\n🔄 Day changed — resetting day counter');
-    dayCounter = 0;
+    dayCounter    = 0;
     lastResetDate = today;
   }
 }
@@ -41,7 +45,12 @@ function getTargetMinute(dateString, startMin, endMin, salt) {
 }
 
 // ─── Core: Insert / Update attendance in Supabase PostgreSQL ────
-async function insertAttendance(type) {
+/**
+ * @param {'checkin'|'checkout'} type
+ * @param {string|null} signInLocation  - location string for check-in
+ * @param {string|null} signOutLocation - location string for check-out
+ */
+async function insertAttendance(type, signInLocation, signOutLocation) {
   checkAndResetCounter();
 
   if (MAX_DAYS > 0 && dayCounter >= MAX_DAYS) {
@@ -51,31 +60,33 @@ async function insertAttendance(type) {
   }
 
   try {
-    const nowIST = moment().tz(TIMEZONE);
-    const date = nowIST.format('YYYY-MM-DD');
+    const nowIST      = moment().tz(TIMEZONE);
+    const date        = nowIST.format('YYYY-MM-DD');
     const datetimeIST = nowIST.format('YYYY-MM-DD HH:mm:ss');
     const datetimeUTC = nowIST.clone().utc().format('YYYY-MM-DD HH:mm:ss');
 
     if (type === 'checkin') {
-      // Check if already checked in today
-      const existing = await pool.query(
-        `SELECT id FROM attendance_logs WHERE employee_id = $1 AND date = $2 AND sign_out_time IS NULL`,
-        [EMPLOYEE_ID, date]
-      );
+      // ── INSERT with ON CONFLICT DO NOTHING ──────────────────────────────────
+      // The unique partial index idx_unique_open_checkin on (employee_id, date)
+      // WHERE sign_out_time IS NULL ensures concurrent cron calls cannot create
+      // duplicate open check-ins — even if the SELECT-before-INSERT race fires.
+      const query = `
+        INSERT INTO attendance_logs
+          (employee_id, employee_name, sign_in_time, date, status, sign_in_location, created_at)
+        VALUES ($1, $2, $3, $4, 'full_day', $5, NOW())
+        ON CONFLICT ON CONSTRAINT idx_unique_open_checkin DO NOTHING
+        RETURNING id
+      `;
+      const result = await pool.query(query, [
+        EMPLOYEE_ID, EMPLOYEE_NAME, datetimeUTC, date, signInLocation
+      ]);
 
-      if (existing.rows.length > 0) {
-        const msg = `⚠️  Already checked in today (${date}). Skipping duplicate check-in.`;
+      // ON CONFLICT DO NOTHING → no rows returned when duplicate
+      if (result.rows.length === 0) {
+        const msg = `⚠️  Already checked in today (${date}). Duplicate blocked by DB constraint.`;
         console.log(msg);
         return { success: false, message: msg };
       }
-
-      // Insert new check-in record
-      const query = `
-        INSERT INTO attendance_logs (employee_id, employee_name, sign_in_time, date, status, created_at)
-        VALUES ($1, $2, $3, $4, 'full_day', NOW())
-        RETURNING id
-      `;
-      const result = await pool.query(query, [EMPLOYEE_ID, EMPLOYEE_NAME, datetimeUTC, date]);
 
       const response = {
         success: true,
@@ -87,18 +98,21 @@ async function insertAttendance(type) {
         time_ist: datetimeIST,
         time_utc: datetimeUTC,
         day_counter: `${dayCounter + 1}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`,
-        sign_in_location: "F/N Ward, Maharashtra",
-        sign_out_location: "F/N Ward, Maharashtra",
-      };    
+        sign_in_location: signInLocation,
+        sign_out_location: null,
+      };
 
       console.log(`✅ CHECKIN recorded for ${EMPLOYEE_NAME} (${EMPLOYEE_ID})`);
       console.log(`📅 Date: ${date} | ⏰ IST: ${datetimeIST} | UTC: ${datetimeUTC}`);
+      console.log(`📍 Location: ${signInLocation}`);
       return response;
 
     } else if (type === 'checkout') {
       // Check if there's an open check-in to close
       const openRecord = await pool.query(
-        `SELECT id FROM attendance_logs WHERE employee_id = $1 AND date = $2 AND sign_out_time IS NULL ORDER BY id DESC LIMIT 1`,
+        `SELECT id FROM attendance_logs
+          WHERE employee_id = $1 AND date = $2 AND sign_out_time IS NULL
+          ORDER BY id ASC LIMIT 1`,
         [EMPLOYEE_ID, date]
       );
 
@@ -108,20 +122,21 @@ async function insertAttendance(type) {
         return { success: false, message: msg };
       }
 
-      // Update with checkout time and calculate work hours
+      // Update with checkout time, work hours, and location
       const query = `
         UPDATE attendance_logs
-        SET sign_out_time = $1,
-            work_hours = EXTRACT(EPOCH FROM ($1::timestamp - sign_in_time)) / 3600,
-            updated_at = NOW()
-        WHERE employee_id = $2
-          AND date = $3
-          AND sign_out_time IS NULL
-        RETURNING id, sign_in_time, work_hours
+        SET sign_out_time    = $1,
+            work_hours       = EXTRACT(EPOCH FROM ($1::timestamp - sign_in_time)) / 3600,
+            sign_out_location = $2,
+            updated_at       = NOW()
+        WHERE employee_id    = $3
+          AND date           = $4
+          AND sign_out_time  IS NULL
+        RETURNING id, sign_in_time, work_hours, sign_in_location
       `;
-      const result = await pool.query(query, [datetimeUTC, EMPLOYEE_ID, date]);
+      const result = await pool.query(query, [datetimeUTC, signOutLocation, EMPLOYEE_ID, date]);
 
-      // Increment day counter after checkout
+      // Increment day counter after successful checkout
       dayCounter++;
 
       const response = {
@@ -137,12 +152,13 @@ async function insertAttendance(type) {
         time_ist: datetimeIST,
         time_utc: datetimeUTC,
         day_counter: `${dayCounter}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`,
-        sign_in_location: "F/N Ward, Maharashtra",
-        sign_out_location: "F/N Ward, Maharashtra",
+        sign_in_location: result.rows[0].sign_in_location,
+        sign_out_location: signOutLocation,
       };
 
       console.log(`✅ CHECKOUT recorded for ${EMPLOYEE_NAME} (${EMPLOYEE_ID})`);
       console.log(`📅 Date: ${date} | ⏰ IST: ${datetimeIST} | UTC: ${datetimeUTC}`);
+      console.log(`📍 Location: ${signOutLocation}`);
       console.log(`📊 Day Counter: ${dayCounter}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`);
       return response;
     }
@@ -158,24 +174,32 @@ async function insertAttendance(type) {
 
 /**
  * POST /api/login
- * Records a check-in for the configured employee
- * Call this from your external cron between 09:00-09:30 IST Mon-Sat
+ * Records a check-in for the configured employee.
+ * Call this from your external cron between 09:00-09:30 IST Mon-Sat.
+ *
+ * Optional body:
+ *   { "sign_in_location": "Mumbai, Maharashtra, India" }
  */
 app.post('/api/login', async (req, res) => {
   console.log('\n🔔 /api/login called');
-  const result = await insertAttendance('checkin');
+  const signInLocation = req.body?.sign_in_location || DEFAULT_SIGNIN_LOCATION;
+  const result = await insertAttendance('checkin', signInLocation, null);
   const statusCode = result.success ? 200 : 400;
   res.status(statusCode).json(result);
 });
 
 /**
  * POST /api/logout
- * Records a check-out for the configured employee
- * Call this from your external cron between 18:30-19:00 IST Mon-Sat
+ * Records a check-out for the configured employee.
+ * Call this from your external cron between 18:30-19:00 IST Mon-Sat.
+ *
+ * Optional body:
+ *   { "sign_out_location": "P/S Mumbai, Maharashtra, India" }
  */
 app.post('/api/logout', async (req, res) => {
   console.log('\n🔔 /api/logout called');
-  const result = await insertAttendance('checkout');
+  const signOutLocation = req.body?.sign_out_location || DEFAULT_SIGNOUT_LOCATION;
+  const result = await insertAttendance('checkout', null, signOutLocation);
   const statusCode = result.success ? 200 : 400;
   res.status(statusCode).json(result);
 });
@@ -187,7 +211,7 @@ app.post('/api/logout', async (req, res) => {
 app.get('/api/status', async (req, res) => {
   checkAndResetCounter();
   const nowIST = moment().tz(TIMEZONE);
-  const date = nowIST.format('YYYY-MM-DD');
+  const date   = nowIST.format('YYYY-MM-DD');
 
   try {
     const todayRecords = await pool.query(
@@ -204,7 +228,7 @@ app.get('/api/status', async (req, res) => {
       day_counter: `${dayCounter}/${MAX_DAYS > 0 ? MAX_DAYS : '∞'}`,
       today_records: todayRecords.rows,
       // Suggested cron times for external server
-      suggested_checkin_minute: `09:${getTargetMinute(date, 0, 30, 'checkin').toString().padStart(2, '0')} IST`,
+      suggested_checkin_minute:  `09:${getTargetMinute(date, 0, 30, 'checkin').toString().padStart(2, '0')} IST`,
       suggested_checkout_minute: `18:${getTargetMinute(date, 30, 59, 'checkout').toString().padStart(2, '0')} IST`
     });
   } catch (error) {
@@ -218,12 +242,12 @@ app.get('/api/status', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'Attendance Tracker',
-    version: '1.0.0',
+    version: '2.0.0',
     database: 'Supabase PostgreSQL',
     endpoints: {
-      login: 'POST /api/login',
+      login:  'POST /api/login',
       logout: 'POST /api/logout',
-      status: 'GET /api/status'
+      status: 'GET  /api/status'
     }
   });
 });
@@ -234,6 +258,8 @@ app.listen(PORT, () => {
   console.log(`👤 Tracking: ${EMPLOYEE_NAME} (${EMPLOYEE_ID})`);
   console.log(`📅 Max Days: ${MAX_DAYS > 0 ? MAX_DAYS : 'Unlimited'}`);
   console.log(`🌍 Timezone: ${TIMEZONE}`);
+  console.log(`📍 Default sign-in  location: ${DEFAULT_SIGNIN_LOCATION}`);
+  console.log(`📍 Default sign-out location: ${DEFAULT_SIGNOUT_LOCATION}`);
   console.log(`\n📡 Endpoints:`);
   console.log(`   POST http://localhost:${PORT}/api/login   → Check-in`);
   console.log(`   POST http://localhost:${PORT}/api/logout  → Check-out`);
