@@ -74,7 +74,7 @@ async function insertAttendance(type, signInLocation, signOutLocation) {
         INSERT INTO attendance_logs
           (employee_id, employee_name, sign_in_time, date, status, sign_in_location, created_at)
         VALUES ($1, $2, $3, $4, 'full_day', $5, NOW())
-        ON CONFLICT ON CONSTRAINT idx_unique_open_checkin DO NOTHING
+        ON CONFLICT (employee_id, date) WHERE sign_out_time IS NULL DO NOTHING
         RETURNING id
       `;
       const result = await pool.query(query, [
@@ -182,6 +182,24 @@ async function insertAttendance(type, signInLocation, signOutLocation) {
  */
 app.post('/api/login', async (req, res) => {
   console.log('\n🔔 /api/login called');
+
+  // ── Time-window guard: only allow sign-in between 8:30 AM – 10:30 AM IST ──
+  // Pass { "force": true } in the request body to bypass (for manual corrections)
+  const force = req.body?.force === true;
+  if (!force) {
+    const nowIST = moment().tz(TIMEZONE);
+    const hour   = nowIST.hours();
+    const min    = nowIST.minutes();
+    const totalMin = hour * 60 + min;
+    const windowStart = 8 * 60 + 30;   // 08:30 IST
+    const windowEnd   = 10 * 60 + 30;  // 10:30 IST
+    if (totalMin < windowStart || totalMin > windowEnd) {
+      const msg = `⛔ Sign-in blocked outside allowed window (08:30–10:30 IST). Current IST: ${nowIST.format('HH:mm')}. Use { "force": true } to override.`;
+      console.log(msg);
+      return res.status(403).json({ success: false, message: msg });
+    }
+  }
+
   const signInLocation = req.body?.sign_in_location || DEFAULT_SIGNIN_LOCATION;
   const result = await insertAttendance('checkin', signInLocation, null);
   const statusCode = result.success ? 200 : 400;
@@ -198,6 +216,24 @@ app.post('/api/login', async (req, res) => {
  */
 app.post('/api/logout', async (req, res) => {
   console.log('\n🔔 /api/logout called');
+
+  // ── Time-window guard: only allow sign-out between 6:00 PM – 7:30 PM IST ──
+  // Pass { "force": true } in the request body to bypass (for manual corrections)
+  const force = req.body?.force === true;
+  if (!force) {
+    const nowIST = moment().tz(TIMEZONE);
+    const hour   = nowIST.hours();
+    const min    = nowIST.minutes();
+    const totalMin = hour * 60 + min;
+    const windowStart = 18 * 60 + 0;   // 18:00 IST
+    const windowEnd   = 19 * 60 + 30;  // 19:30 IST
+    if (totalMin < windowStart || totalMin > windowEnd) {
+      const msg = `⛔ Sign-out blocked outside allowed window (18:00–19:30 IST). Current IST: ${nowIST.format('HH:mm')}. Use { "force": true } to override.`;
+      console.log(msg);
+      return res.status(403).json({ success: false, message: msg });
+    }
+  }
+
   const signOutLocation = req.body?.sign_out_location || DEFAULT_SIGNOUT_LOCATION;
   const result = await insertAttendance('checkout', null, signOutLocation);
   const statusCode = result.success ? 200 : 400;
@@ -253,15 +289,21 @@ app.get('/', (req, res) => {
 });
 
 // ─── Start Server ───────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`\n🚀 Attendance API server running on port ${PORT}`);
-  console.log(`👤 Tracking: ${EMPLOYEE_NAME} (${EMPLOYEE_ID})`);
-  console.log(`📅 Max Days: ${MAX_DAYS > 0 ? MAX_DAYS : 'Unlimited'}`);
-  console.log(`🌍 Timezone: ${TIMEZONE}`);
-  console.log(`📍 Default sign-in  location: ${DEFAULT_SIGNIN_LOCATION}`);
-  console.log(`📍 Default sign-out location: ${DEFAULT_SIGNOUT_LOCATION}`);
-  console.log(`\n📡 Endpoints:`);
-  console.log(`   POST http://localhost:${PORT}/api/login   → Check-in`);
-  console.log(`   POST http://localhost:${PORT}/api/logout  → Check-out`);
-  console.log(`   GET  http://localhost:${PORT}/api/status  → Current status`);
-});
+// Export for Vercel serverless (module.exports is required by @vercel/node)
+module.exports = app;
+
+// Also start locally when run directly with `node app.js`
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`\n🚀 Attendance API server running on port ${PORT}`);
+    console.log(`👤 Tracking: ${EMPLOYEE_NAME} (${EMPLOYEE_ID})`);
+    console.log(`📅 Max Days: ${MAX_DAYS > 0 ? MAX_DAYS : 'Unlimited'}`);
+    console.log(`🌍 Timezone: ${TIMEZONE}`);
+    console.log(`📍 Default sign-in  location: ${DEFAULT_SIGNIN_LOCATION}`);
+    console.log(`📍 Default sign-out location: ${DEFAULT_SIGNOUT_LOCATION}`);
+    console.log(`\n📡 Endpoints:`);
+    console.log(`   POST http://localhost:${PORT}/api/login   → Check-in`);
+    console.log(`   POST http://localhost:${PORT}/api/logout  → Check-out`);
+    console.log(`   GET  http://localhost:${PORT}/api/status  → Current status`);
+  });
+}
